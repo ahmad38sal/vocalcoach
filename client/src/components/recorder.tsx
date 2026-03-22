@@ -8,14 +8,17 @@ interface RecorderProps {
 }
 
 export function Recorder({ onRecordingComplete, disabled }: RecorderProps) {
-  const [state, setState] = useState<"idle" | "countdown" | "recording" | "processing">("idle");
+  const [state, setState] = useState<"idle" | "countdown" | "recording" | "processing" | "error">("idle");
   const [countdown, setCountdown] = useState(3);
   const [duration, setDuration] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
   const chunks = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
   const startTimeRef = useRef<number>(0);
+  const onRecordingCompleteRef = useRef(onRecordingComplete);
+  onRecordingCompleteRef.current = onRecordingComplete;
 
   const cleanup = useCallback(() => {
     if (timerRef.current) {
@@ -30,31 +33,22 @@ export function Recorder({ onRecordingComplete, disabled }: RecorderProps) {
 
   useEffect(() => () => cleanup(), [cleanup]);
 
-  const startCountdown = useCallback(async () => {
-    setState("countdown");
-    setCountdown(3);
-
-    // Get mic permission early
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-    let count = 3;
-    const countInterval = setInterval(() => {
-      count--;
-      setCountdown(count);
-      if (count <= 0) {
-        clearInterval(countInterval);
-        startRecording(stream);
-      }
-    }, 800);
-  }, []);
-
-  const startRecording = useCallback((stream: MediaStream) => {
+  const beginRecording = useCallback((stream: MediaStream) => {
     setState("recording");
     setDuration(0);
     chunks.current = [];
     startTimeRef.current = Date.now();
 
-    const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    // Pick a supported mimeType
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "";
+
+    const recorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
     mediaRecorder.current = recorder;
 
     recorder.ondataavailable = (e) => {
@@ -65,28 +59,54 @@ export function Recorder({ onRecordingComplete, disabled }: RecorderProps) {
       setState("processing");
       stream.getTracks().forEach(t => t.stop());
 
-      const blob = new Blob(chunks.current, { type: "audio/webm" });
+      const blob = new Blob(chunks.current, { type: recorder.mimeType });
 
-      // Decode to AudioBuffer for analysis
       if (!audioContext.current) {
         audioContext.current = new AudioContext();
       }
       try {
         const arrayBuffer = await blob.arrayBuffer();
         const audioBuffer = await audioContext.current.decodeAudioData(arrayBuffer);
-        onRecordingComplete(blob, audioBuffer);
+        onRecordingCompleteRef.current(blob, audioBuffer);
       } catch (err) {
         console.error("Failed to decode audio:", err);
       }
       setState("idle");
     };
 
-    recorder.start(100); // collect every 100ms
+    recorder.start(100);
 
     timerRef.current = window.setInterval(() => {
       setDuration((Date.now() - startTimeRef.current) / 1000);
     }, 100);
-  }, [onRecordingComplete]);
+  }, []);
+
+  const startCountdown = useCallback(async () => {
+    setState("countdown");
+    setCountdown(3);
+    setErrorMsg("");
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      console.error("Mic access denied:", err);
+      setErrorMsg("Microphone access is needed to record. Please allow mic access and try again.");
+      setState("error");
+      return;
+    }
+
+    let count = 3;
+    const countInterval = setInterval(() => {
+      count--;
+      if (count > 0) {
+        setCountdown(count);
+      } else {
+        clearInterval(countInterval);
+        beginRecording(stream);
+      }
+    }, 800);
+  }, [beginRecording]);
 
   const stopRecording = useCallback(() => {
     if (timerRef.current) {
@@ -128,8 +148,14 @@ export function Recorder({ onRecordingComplete, disabled }: RecorderProps) {
         </div>
       )}
 
+      {state === "error" && (
+        <p className="text-sm text-destructive text-center max-w-xs" data-testid="text-mic-error">
+          {errorMsg}
+        </p>
+      )}
+
       <div className="flex gap-3">
-        {state === "idle" && (
+        {(state === "idle" || state === "error") && (
           <Button
             size="lg"
             onClick={startCountdown}
