@@ -14,7 +14,7 @@ import { analyzePitch, analyzeLoudness, suggestDrills, type DrillSuggestion } fr
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { Line, Recording, Metrics } from "@shared/schema";
+import type { Song, Line, Recording, Metrics } from "@shared/schema";
 
 interface AnalysisResult {
   pitchData: Array<{ time: number; freq: number | null; midi: number | null; note: string | null; deviation?: number }>;
@@ -43,6 +43,16 @@ export default function LinePractice() {
       const res = await apiRequest("GET", `/api/lines/${lineId}`);
       return res.json();
     },
+  });
+
+  // Fetch parent song to get audio URL
+  const { data: parentSong } = useQuery<Song>({
+    queryKey: ["/api/songs", line?.songId],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/songs/${line!.songId}`);
+      return res.json();
+    },
+    enabled: !!line?.songId,
   });
 
   const { data: recordings } = useQuery<Recording[]>({
@@ -301,6 +311,10 @@ export default function LinePractice() {
             referenceNotes={referenceData
               .filter(r => r.midi !== null)
               .map(r => ({ time: r.time, midi: r.midi!, note: r.note! }))}
+            targetPitchData={line?.targetPitchData ? JSON.parse(line.targetPitchData) : undefined}
+            lineAudioUrl={parentSong?.sourceUrl || undefined}
+            lineStartTime={line?.startTime ?? undefined}
+            lineEndTime={line?.endTime ?? undefined}
           />
         </TabsContent>
 

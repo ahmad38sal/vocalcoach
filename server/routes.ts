@@ -7,6 +7,48 @@ import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
 
+// Server-side pitch detection (autocorrelation)
+function detectPitchServer(buffer: Float32Array, sampleRate: number): number | null {
+  const SIZE = buffer.length;
+  const MAX_SAMPLES = Math.floor(SIZE / 2);
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) rms += buffer[i] * buffer[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.005) return null;
+
+  const minPeriod = Math.floor(sampleRate / 1000);
+  const maxPeriod = Math.min(Math.floor(sampleRate / 60), MAX_SAMPLES);
+  const correlations = new Float32Array(maxPeriod + 1);
+  let bestOffset = -1;
+  let bestCorrelation = 0;
+  let foundGood = false;
+
+  for (let offset = minPeriod; offset <= maxPeriod; offset++) {
+    let correlation = 0;
+    for (let i = 0; i < MAX_SAMPLES; i++) {
+      correlation += Math.abs(buffer[i] - buffer[i + offset]);
+    }
+    correlation = 1 - correlation / MAX_SAMPLES;
+    correlations[offset] = correlation;
+    if (correlation > 0.7 && correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestOffset = offset;
+      foundGood = true;
+    } else if (foundGood && correlation < bestCorrelation - 0.1) {
+      break;
+    }
+  }
+
+  if (bestCorrelation > 0.5 && bestOffset > 0) {
+    const prev = bestOffset > minPeriod ? correlations[bestOffset - 1] : correlations[bestOffset];
+    const next = bestOffset < maxPeriod ? correlations[bestOffset + 1] : correlations[bestOffset];
+    const denom = 2 * (2 * correlations[bestOffset] - prev - next);
+    const shift = denom !== 0 ? (next - prev) / denom : 0;
+    return sampleRate / (bestOffset + shift);
+  }
+  return null;
+}
+
 // Ensure uploads directory exists
 const uploadsDir = path.resolve("uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
@@ -201,9 +243,97 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     res.status(201).json(line);
   });
 
+  app.patch("/api/lines/:id", (req, res) => {
+    const line = storage.updateLine(Number(req.params.id), req.body);
+    if (!line) return res.status(404).json({ error: "Line not found" });
+    res.json(line);
+  });
+
   app.delete("/api/lines/:id", (req, res) => {
     storage.deleteLine(Number(req.params.id));
     res.json({ ok: true });
+  });
+
+  // --- Audio clip extraction (for line timestamps) ---
+  app.get("/api/audio-clip/:filename", (req, res) => {
+    const { start, end } = req.query;
+    const filePath = path.join(uploadsDir, req.params.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+    if (start !== undefined && end !== undefined) {
+      // Extract clip using ffmpeg
+      const clipPath = path.join(uploadsDir, `clip_${Date.now()}.mp3`);
+      try {
+        const duration = Number(end) - Number(start);
+        execSync(
+          `ffmpeg -y -i "${filePath}" -ss ${Number(start)} -t ${duration} -acodec libmp3lame -q:a 5 "${clipPath}"`,
+          { timeout: 15000 }
+        );
+        res.sendFile(clipPath, () => {
+          // Clean up temp clip after sending
+          try { fs.unlinkSync(clipPath); } catch { }
+        });
+      } catch {
+        return res.status(500).json({ error: "Could not extract clip" });
+      }
+    } else {
+      res.sendFile(filePath);
+    }
+  });
+
+  // --- Analyze pitch of song audio segment (for target pitch) ---
+  app.post("/api/analyze-audio-pitch", (req, res) => {
+    const { audioUrl, startTime, endTime } = req.body;
+    if (!audioUrl) return res.status(400).json({ error: "audioUrl required" });
+
+    try {
+      // audioUrl is like /api/audio/filename.mp3
+      const filename = audioUrl.split("/").pop();
+      const filePath = path.join(uploadsDir, filename || "");
+      if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Audio file not found" });
+
+      // Extract segment as raw PCM using ffmpeg
+      const rawPath = path.join(uploadsDir, `raw_${Date.now()}.raw`);
+      let ffmpegCmd = `ffmpeg -y -i "${filePath}"`;
+      if (startTime !== undefined && endTime !== undefined) {
+        const duration = Number(endTime) - Number(startTime);
+        ffmpegCmd += ` -ss ${Number(startTime)} -t ${duration}`;
+      }
+      ffmpegCmd += ` -ar 44100 -ac 1 -f f32le "${rawPath}"`;
+      execSync(ffmpegCmd, { timeout: 30000 });
+
+      // Read raw PCM data and run pitch detection
+      const rawData = fs.readFileSync(rawPath);
+      const floats = new Float32Array(rawData.buffer, rawData.byteOffset, rawData.byteLength / 4);
+
+      const sampleRate = 44100;
+      const windowMs = 50;
+      const windowSamples = Math.floor((sampleRate * windowMs) / 1000);
+      const pitchData: Array<{ time: number; freq: number | null; midi: number | null; note: string | null }> = [];
+
+      for (let i = 0; i < floats.length - windowSamples * 2; i += windowSamples) {
+        const slice = floats.slice(i, i + windowSamples * 2);
+        const freq = detectPitchServer(slice, sampleRate);
+        const time = i / sampleRate;
+        if (freq && freq > 60 && freq < 2000) {
+          const midi = 69 + 12 * Math.log2(freq / 440);
+          const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+          const noteNum = Math.round(midi) % 12;
+          const octave = Math.floor(Math.round(midi) / 12) - 1;
+          pitchData.push({ time, freq, midi, note: noteNames[noteNum >= 0 ? noteNum : noteNum + 12] + octave });
+        } else {
+          pitchData.push({ time, freq: null, midi: null, note: null });
+        }
+      }
+
+      // Clean up
+      try { fs.unlinkSync(rawPath); } catch { }
+
+      res.json({ pitchData });
+    } catch (err: any) {
+      console.error("Audio pitch analysis error:", err.message);
+      res.status(500).json({ error: "Could not analyze audio" });
+    }
   });
 
   // --- Recordings ---

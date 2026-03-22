@@ -33,7 +33,10 @@ sqlite.exec(`
     song_id INTEGER NOT NULL,
     text TEXT NOT NULL,
     order_index INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER DEFAULT 1
+    is_active INTEGER DEFAULT 1,
+    start_time REAL,
+    end_time REAL,
+    target_pitch_data TEXT
   );
   CREATE TABLE IF NOT EXISTS recordings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,6 +95,17 @@ sqlite.exec(`
     completed INTEGER DEFAULT 0
   );
 `);
+
+// Migrate existing tables — add columns if missing
+try {
+  sqlite.exec(`ALTER TABLE lines ADD COLUMN start_time REAL`);
+} catch { /* column already exists */ }
+try {
+  sqlite.exec(`ALTER TABLE lines ADD COLUMN end_time REAL`);
+} catch { /* column already exists */ }
+try {
+  sqlite.exec(`ALTER TABLE lines ADD COLUMN target_pitch_data TEXT`);
+} catch { /* column already exists */ }
 
 export interface IStorage {
   // Songs

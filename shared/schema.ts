@@ -20,6 +20,9 @@ export const lines = sqliteTable("lines", {
   text: text("text").notNull(),
   orderIndex: integer("order_index").notNull().default(0),
   isActive: integer("is_active", { mode: "boolean" }).default(true),
+  startTime: real("start_time"), // seconds into song audio where this line starts
+  endTime: real("end_time"),     // seconds into song audio where this line ends
+  targetPitchData: text("target_pitch_data"), // JSON array of {time, freq, midi, note} from original audio
 });
 
 // Recordings table — individual vocal takes

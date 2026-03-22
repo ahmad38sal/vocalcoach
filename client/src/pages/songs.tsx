@@ -22,8 +22,32 @@ export default function Songs() {
   const [sourceTab, setSourceTab] = useState("lyrics");
   const [isExtracting, setIsExtracting] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isFetchingLyrics, setIsFetchingLyrics] = useState(false);
   const [audioSource, setAudioSource] = useState<{ type: string; url: string } | null>(null);
   const { toast } = useToast();
+
+  // Auto-fetch lyrics from lrclib.net
+  const fetchLyrics = async (opts: { artist?: string; track?: string; query?: string }) => {
+    setIsFetchingLyrics(true);
+    try {
+      const params = new URLSearchParams();
+      if (opts.artist) params.set("artist", opts.artist);
+      if (opts.track) params.set("track", opts.track);
+      if (opts.query) params.set("q", opts.query);
+      const res = await apiRequest("GET", `/api/lyrics?${params.toString()}`);
+      const data = await res.json();
+      if (data.lyrics) {
+        setLyrics(data.lyrics);
+        if (!artist.trim() && data.artist) setArtist(data.artist);
+        toast({ title: "Lyrics found", description: "We auto-filled the lyrics for you. Feel free to edit them." });
+      } else {
+        toast({ title: "No lyrics found", description: "We couldn't find lyrics automatically. You can type them in manually.", variant: "destructive" });
+      }
+    } catch {
+      // Silently fail — user can still type lyrics manually
+    }
+    setIsFetchingLyrics(false);
+  };
 
   const { data: songs, isLoading } = useQuery<Song[]>({
     queryKey: ["/api/songs"],
@@ -85,7 +109,17 @@ export default function Songs() {
         const filename = data.filePath.split("/").pop() || data.filePath.split("\\").pop();
         setAudioSource({ type: "youtube", url: `/api/audio/${filename}` });
         if (!title.trim() && data.title) setTitle(data.title);
+        if (data.artist) setArtist(data.artist);
         toast({ title: "Audio extracted", description: "Song audio downloaded from YouTube." });
+
+        // Auto-fetch lyrics using artist/track metadata from YouTube
+        if (!lyrics.trim()) {
+          const lyricsArtist = data.artist || "";
+          const lyricsTrack = data.track || data.title || "";
+          if (lyricsArtist || lyricsTrack) {
+            fetchLyrics({ artist: lyricsArtist, track: lyricsTrack, query: `${lyricsArtist} ${lyricsTrack}`.trim() });
+          }
+        }
       }
     } catch (err: any) {
       toast({ title: "Extraction failed", description: "Could not extract audio. Check the URL and try again.", variant: "destructive" });
@@ -100,15 +134,21 @@ export default function Songs() {
     try {
       const formData = new FormData();
       formData.append("audio", file);
-      const res = await fetch("/api/upload-audio", { method: "POST", body: formData });
+      const res = await apiRequest("POST", "/api/upload-audio", formData);
       const data = await res.json();
       if (data.filePath) {
         const filename = data.filePath.split("/").pop() || data.filePath.split("\\").pop();
         setAudioSource({ type: "upload", url: `/api/audio/${filename}` });
+        const songName = file.name.replace(/\.[^/.]+$/, "");
         if (!title.trim()) {
-          setTitle(file.name.replace(/\.[^/.]+$/, ""));
+          setTitle(songName);
         }
         toast({ title: "File uploaded", description: `${file.name} is ready.` });
+
+        // Auto-fetch lyrics using the filename as a search query
+        if (!lyrics.trim()) {
+          fetchLyrics({ query: songName });
+        }
       }
     } catch {
       toast({ title: "Upload failed", description: "Could not upload the file.", variant: "destructive" });
@@ -195,7 +235,8 @@ export default function Songs() {
                   {audioSource?.type === "youtube" && (
                     <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
                       <Music className="w-4 h-4" />
-                      Audio extracted — add lyrics below
+                      Audio extracted{isFetchingLyrics ? " — looking up lyrics..." : lyrics.trim() ? " — lyrics auto-filled below" : " — add lyrics below"}
+                      {isFetchingLyrics && <Loader2 className="w-3 h-3 animate-spin" />}
                     </div>
                   )}
                 </TabsContent>
@@ -222,7 +263,8 @@ export default function Songs() {
                   {audioSource?.type === "upload" && (
                     <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
                       <Music className="w-4 h-4" />
-                      File uploaded — add lyrics below
+                      File uploaded{isFetchingLyrics ? " — looking up lyrics..." : lyrics.trim() ? " — lyrics auto-filled below" : " — add lyrics below"}
+                      {isFetchingLyrics && <Loader2 className="w-3 h-3 animate-spin" />}
                     </div>
                   )}
                 </TabsContent>
