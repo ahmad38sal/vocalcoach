@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, Mic, Plus, Trash2 } from "lucide-react";
+import { ArrowLeft, Mic, Plus, Trash2, Play, Youtube, Upload } from "lucide-react";import { Badge } from "@/components/ui/badge";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { Song, Line } from "@shared/schema";
@@ -89,8 +89,24 @@ export default function SongDetail() {
         <div>
           <h1 className="text-xl font-semibold" data-testid="text-song-title">{song.title}</h1>
           {song.artist && <p className="text-sm text-muted-foreground">{song.artist}</p>}
+          {song.sourceType !== "recorded" && (
+            <Badge variant="secondary" className="text-xs mt-1 gap-1">
+              {song.sourceType === "youtube" ? <Youtube className="w-3 h-3" /> : <Upload className="w-3 h-3" />}
+              {song.sourceType === "youtube" ? "YouTube" : "Uploaded"}
+            </Badge>
+          )}
         </div>
       </div>
+
+      {/* Audio player if song has audio */}
+      {song.sourceUrl && (
+        <div className="rounded-lg border p-3 bg-muted/30">
+          <p className="text-xs text-muted-foreground mb-2">Song audio</p>
+          <audio controls className="w-full h-10" src={song.sourceUrl} data-testid="audio-player">
+            Your browser does not support audio playback.
+          </audio>
+        </div>
+      )}
 
       <div>
         <h2 className="text-sm font-medium text-muted-foreground mb-3">

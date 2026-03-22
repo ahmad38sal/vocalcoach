@@ -7,7 +7,8 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { Music, Plus, ArrowRight, Trash2 } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Music, Plus, ArrowRight, Trash2, Upload, Youtube, Loader2 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import type { Song } from "@shared/schema";
@@ -17,6 +18,11 @@ export default function Songs() {
   const [title, setTitle] = useState("");
   const [artist, setArtist] = useState("");
   const [lyrics, setLyrics] = useState("");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [sourceTab, setSourceTab] = useState("lyrics");
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [audioSource, setAudioSource] = useState<{ type: string; url: string } | null>(null);
   const { toast } = useToast();
 
   const { data: songs, isLoading } = useQuery<Song[]>({
@@ -28,16 +34,16 @@ export default function Songs() {
       const song = await apiRequest("POST", "/api/songs", {
         title,
         artist: artist || null,
-        sourceType: "recorded",
-        sourceUrl: null,
+        sourceType: audioSource ? (audioSource.type === "youtube" ? "youtube" : "upload") : "recorded",
+        sourceUrl: audioSource?.url || youtubeUrl || null,
       });
       const songData = await song.json();
 
       // Create lines from lyrics
-      const lines = lyrics.split("\n").filter(l => l.trim());
-      for (let i = 0; i < lines.length; i++) {
+      const lineTexts = lyrics.split("\n").filter(l => l.trim());
+      for (let i = 0; i < lineTexts.length; i++) {
         await apiRequest("POST", `/api/songs/${songData.id}/lines`, {
-          text: lines[i].trim(),
+          text: lineTexts[i].trim(),
           orderIndex: i,
         });
       }
@@ -45,9 +51,7 @@ export default function Songs() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/songs"] });
-      setTitle("");
-      setArtist("");
-      setLyrics("");
+      resetForm();
       setOpen(false);
       toast({ title: "Song added", description: "Your song is ready to practice." });
     },
@@ -62,6 +66,56 @@ export default function Songs() {
     },
   });
 
+  const resetForm = () => {
+    setTitle("");
+    setArtist("");
+    setLyrics("");
+    setYoutubeUrl("");
+    setSourceTab("lyrics");
+    setAudioSource(null);
+  };
+
+  const handleYoutubeExtract = async () => {
+    if (!youtubeUrl.trim()) return;
+    setIsExtracting(true);
+    try {
+      const res = await apiRequest("POST", "/api/youtube-extract", { url: youtubeUrl });
+      const data = await res.json();
+      if (data.filePath) {
+        const filename = data.filePath.split("/").pop() || data.filePath.split("\\").pop();
+        setAudioSource({ type: "youtube", url: `/api/audio/${filename}` });
+        if (!title.trim() && data.title) setTitle(data.title);
+        toast({ title: "Audio extracted", description: "Song audio downloaded from YouTube." });
+      }
+    } catch (err: any) {
+      toast({ title: "Extraction failed", description: "Could not extract audio. Check the URL and try again.", variant: "destructive" });
+    }
+    setIsExtracting(false);
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("audio", file);
+      const res = await fetch("/api/upload-audio", { method: "POST", body: formData });
+      const data = await res.json();
+      if (data.filePath) {
+        const filename = data.filePath.split("/").pop() || data.filePath.split("\\").pop();
+        setAudioSource({ type: "upload", url: `/api/audio/${filename}` });
+        if (!title.trim()) {
+          setTitle(file.name.replace(/\.[^/.]+$/, ""));
+        }
+        toast({ title: "File uploaded", description: `${file.name} is ready.` });
+      }
+    } catch {
+      toast({ title: "Upload failed", description: "Could not upload the file.", variant: "destructive" });
+    }
+    setIsUploading(false);
+  };
+
   return (
     <div className="p-6 max-w-3xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
@@ -69,14 +123,14 @@ export default function Songs() {
           <h1 className="text-xl font-semibold" data-testid="text-page-title">My Songs</h1>
           <p className="text-sm text-muted-foreground mt-0.5">Add songs and pick lines to practice</p>
         </div>
-        <Dialog open={open} onOpenChange={setOpen}>
+        <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
           <DialogTrigger asChild>
             <Button className="gap-1.5" data-testid="button-add-song">
               <Plus className="w-4 h-4" />
               Add Song
             </Button>
           </DialogTrigger>
-          <DialogContent>
+          <DialogContent className="max-w-lg">
             <DialogHeader>
               <DialogTitle>Add a new song</DialogTitle>
             </DialogHeader>
@@ -101,6 +155,81 @@ export default function Songs() {
                   data-testid="input-song-artist"
                 />
               </div>
+
+              {/* Source tabs */}
+              <Tabs value={sourceTab} onValueChange={setSourceTab}>
+                <TabsList className="grid w-full grid-cols-3">
+                  <TabsTrigger value="lyrics" className="text-xs">Lyrics only</TabsTrigger>
+                  <TabsTrigger value="youtube" className="text-xs gap-1">
+                    <Youtube className="w-3 h-3" /> YouTube
+                  </TabsTrigger>
+                  <TabsTrigger value="upload" className="text-xs gap-1">
+                    <Upload className="w-3 h-3" /> Upload
+                  </TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="youtube" className="space-y-3 mt-3">
+                  <div>
+                    <Label htmlFor="youtube-url">YouTube link</Label>
+                    <div className="flex gap-2 mt-1">
+                      <Input
+                        id="youtube-url"
+                        placeholder="https://youtube.com/watch?v=..."
+                        value={youtubeUrl}
+                        onChange={(e) => setYoutubeUrl(e.target.value)}
+                        data-testid="input-youtube-url"
+                      />
+                      <Button
+                        onClick={handleYoutubeExtract}
+                        disabled={!youtubeUrl.trim() || isExtracting}
+                        size="sm"
+                        data-testid="button-extract-youtube"
+                      >
+                        {isExtracting ? <Loader2 className="w-4 h-4 animate-spin" /> : "Extract"}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Paste a YouTube link and we'll grab the audio for you.
+                    </p>
+                  </div>
+                  {audioSource?.type === "youtube" && (
+                    <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
+                      <Music className="w-4 h-4" />
+                      Audio extracted — add lyrics below
+                    </div>
+                  )}
+                </TabsContent>
+
+                <TabsContent value="upload" className="space-y-3 mt-3">
+                  <div>
+                    <Label htmlFor="audio-file">Audio file (MP3, WAV, M4A)</Label>
+                    <Input
+                      id="audio-file"
+                      type="file"
+                      accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.webm"
+                      onChange={handleFileUpload}
+                      disabled={isUploading}
+                      className="mt-1"
+                      data-testid="input-audio-file"
+                    />
+                  </div>
+                  {isUploading && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Uploading...
+                    </div>
+                  )}
+                  {audioSource?.type === "upload" && (
+                    <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
+                      <Music className="w-4 h-4" />
+                      File uploaded — add lyrics below
+                    </div>
+                  )}
+                </TabsContent>
+
+                <TabsContent value="lyrics" className="mt-0" />
+              </Tabs>
+
               <div>
                 <Label htmlFor="lyrics">Lyrics / lines (one per line)</Label>
                 <Textarea

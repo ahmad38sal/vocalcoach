@@ -1,19 +1,20 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ArrowLeft, Star, CheckCircle2, Lightbulb, MessageCircle } from "lucide-react";
+import { ArrowLeft, Star, CheckCircle2, Lightbulb, MessageCircle, Activity } from "lucide-react";
 import { Recorder } from "@/components/recorder";
+import { LivePitchMonitor } from "@/components/live-pitch-monitor";
 import { PitchChart } from "@/components/pitch-chart";
 import { LoudnessChart } from "@/components/loudness-chart";
 import { analyzePitch, analyzeLoudness, suggestDrills, type DrillSuggestion } from "@/lib/audio-analysis";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { Line, Recording } from "@shared/schema";
+import type { Line, Recording, Metrics } from "@shared/schema";
 
 interface AnalysisResult {
   pitchData: Array<{ time: number; freq: number | null; midi: number | null; note: string | null; deviation?: number }>;
@@ -34,6 +35,7 @@ export default function LinePractice() {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [referenceData, setReferenceData] = useState<Array<{ time: number; midi: number | null; note: string | null }>>([]);
   const [takeCount, setTakeCount] = useState(0);
+  const [activeTab, setActiveTab] = useState("live");
 
   const { data: line, isLoading: lineLoading } = useQuery<Line>({
     queryKey: ["/api/lines", lineId],
@@ -50,6 +52,65 @@ export default function LinePractice() {
       return res.json();
     },
   });
+
+  // Load existing metrics from backend (persist across navigation)
+  const { data: existingMetrics } = useQuery<Metrics[]>({
+    queryKey: ["/api/lines", lineId, "metrics"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/lines/${lineId}/metrics`);
+      return res.json();
+    },
+  });
+
+  // Restore last analysis from existing metrics on mount
+  useEffect(() => {
+    if (existingMetrics && existingMetrics.length > 0 && !analysis) {
+      const latest = existingMetrics[existingMetrics.length - 1];
+      try {
+        const pitchData = latest.pitchData ? JSON.parse(latest.pitchData) : [];
+        const loudnessData = latest.loudnessData ? JSON.parse(latest.loudnessData) : [];
+        const drills = suggestDrills(pitchData, loudnessData, line?.text || "");
+        setAnalysis({
+          pitchData,
+          loudnessData,
+          drills,
+          greenSegments: latest.greenSegments || 0,
+          redSegments: latest.redSegments || 0,
+          avgDeviation: latest.avgPitchDeviation || 0,
+          energyDropoff: latest.energyDropoff || 0,
+          overallScore: latest.overallScore || 0,
+        });
+        setTakeCount(existingMetrics.length);
+      } catch { /* parse failed */ }
+    }
+  }, [existingMetrics, analysis, line]);
+
+  // Load reference recording pitch data on mount
+  useEffect(() => {
+    if (referenceData.length === 0 && lineId) {
+      apiRequest("GET", `/api/lines/${lineId}/reference`)
+        .then(res => {
+          if (res.ok) return res.json();
+          return null;
+        })
+        .then(async (refRec) => {
+          if (!refRec?.audioData) return;
+          // Decode reference audio and extract pitch
+          try {
+            const audioCtx = new AudioContext();
+            const binary = atob(refRec.audioData);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+            const channelData = audioBuffer.getChannelData(0);
+            const pitchResults = analyzePitch(channelData, audioBuffer.sampleRate);
+            setReferenceData(pitchResults);
+            audioCtx.close();
+          } catch { /* reference decode failed */ }
+        })
+        .catch(() => { /* no reference */ });
+    }
+  }, [lineId, referenceData.length]);
 
   const saveRecording = useMutation({
     mutationFn: async (data: { audioData: string; duration: number; isReference: boolean; isBaseline: boolean }) => {
@@ -70,6 +131,8 @@ export default function LinePractice() {
           energyDropoff: analysis.energyDropoff,
           breathCutoffs: 0,
           overallScore: analysis.overallScore,
+        }).then(() => {
+          queryClient.invalidateQueries({ queryKey: ["/api/lines", lineId, "metrics"] });
         });
 
         // Save drill suggestions
@@ -98,7 +161,6 @@ export default function LinePractice() {
     // Compare with reference if available
     const pitchWithDeviation = pitchResults.map((p) => {
       if (p.midi === null || referenceData.length === 0) return { ...p, deviation: undefined };
-      // Find closest reference point by time
       const closest = referenceData
         .filter(r => r.midi !== null)
         .reduce((best, r) => {
@@ -147,6 +209,7 @@ export default function LinePractice() {
 
     setAnalysis(result);
     setTakeCount(prev => prev + 1);
+    setActiveTab("feedback");
 
     // Convert blob to base64 and save
     const reader = new FileReader();
@@ -222,12 +285,24 @@ export default function LinePractice() {
         </div>
       </div>
 
-      <Tabs defaultValue="record" className="w-full">
-        <TabsList className="grid w-full grid-cols-3">
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+        <TabsList className="grid w-full grid-cols-4">
+          <TabsTrigger value="live" data-testid="tab-live" className="gap-1">
+            <Activity className="w-3 h-3" /> Live
+          </TabsTrigger>
           <TabsTrigger value="record" data-testid="tab-record">Record</TabsTrigger>
           <TabsTrigger value="feedback" data-testid="tab-feedback" disabled={!analysis}>Feedback</TabsTrigger>
           <TabsTrigger value="drills" data-testid="tab-drills" disabled={!analysis}>Drills</TabsTrigger>
         </TabsList>
+
+        {/* Live Pitch Monitor Tab */}
+        <TabsContent value="live" className="space-y-4 mt-6">
+          <LivePitchMonitor
+            referenceNotes={referenceData
+              .filter(r => r.midi !== null)
+              .map(r => ({ time: r.time, midi: r.midi!, note: r.note! }))}
+          />
+        </TabsContent>
 
         {/* Record Tab */}
         <TabsContent value="record" className="space-y-6 mt-6">

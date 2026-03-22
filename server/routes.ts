@@ -2,6 +2,23 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { storage } from "./storage";
 import { Anthropic } from "@anthropic-ai/sdk";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { execSync } from "child_process";
+
+// Ensure uploads directory exists
+const uploadsDir = path.resolve("uploads");
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+const upload = multer({
+  dest: uploadsDir,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  fileFilter: (_req, file, cb) => {
+    const allowed = ["audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/webm", "audio/mp4", "audio/x-m4a", "audio/aac", "video/mp4"];
+    cb(null, allowed.includes(file.mimetype) || file.originalname.match(/\.(mp3|wav|ogg|webm|m4a|aac|mp4)$/i) !== null);
+  },
+});
 
 export async function registerRoutes(httpServer: Server, app: Express) {
   // --- Songs ---
@@ -27,6 +44,57 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   app.delete("/api/songs/:id", (req, res) => {
     storage.deleteSong(Number(req.params.id));
     res.json({ ok: true });
+  });
+
+  // --- Audio Upload ---
+  app.post("/api/upload-audio", upload.single("audio"), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const ext = path.extname(req.file.originalname).toLowerCase() || ".mp3";
+    const dest = req.file.path + ext;
+    fs.renameSync(req.file.path, dest);
+    res.json({ filePath: dest, originalName: req.file.originalname });
+  });
+
+  // --- YouTube Audio Extract ---
+  app.post("/api/youtube-extract", async (req, res) => {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: "URL required" });
+
+    try {
+      // Get video title first
+      const titleStr = execSync(`yt-dlp --get-title "${url}"`, { encoding: "utf-8", timeout: 30000 }).trim();
+
+      // Download audio as mp3
+      const outFile = path.join(uploadsDir, `yt_${Date.now()}.mp3`);
+      execSync(
+        `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${outFile}" "${url}"`,
+        { timeout: 120000 }
+      );
+
+      // The actual output file might have .mp3 appended by yt-dlp
+      const actualFile = fs.existsSync(outFile) ? outFile : outFile + ".mp3";
+      if (!fs.existsSync(actualFile)) {
+        // Search for the file
+        const files = fs.readdirSync(uploadsDir).filter(f => f.startsWith(`yt_${outFile.split('yt_')[1]?.split('.')[0] || ''}`));
+        if (files.length > 0) {
+          res.json({ filePath: path.join(uploadsDir, files[0]), title: titleStr });
+          return;
+        }
+        return res.status(500).json({ error: "Download failed" });
+      }
+
+      res.json({ filePath: actualFile, title: titleStr });
+    } catch (err: any) {
+      console.error("YouTube extract error:", err.message);
+      res.status(500).json({ error: "Could not extract audio. Check the URL and try again." });
+    }
+  });
+
+  // --- Serve uploaded audio files ---
+  app.get("/api/audio/:filename", (req, res) => {
+    const filePath = path.join(uploadsDir, req.params.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+    res.sendFile(filePath);
   });
 
   // --- Lines ---
