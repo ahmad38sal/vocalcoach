@@ -49,8 +49,9 @@ function detectPitchServer(buffer: Float32Array, sampleRate: number): number | n
   return null;
 }
 
-// Ensure uploads directory exists
-const uploadsDir = path.resolve("uploads");
+// Ensure uploads directory exists (use DATA_DIR for Railway volume persistence)
+const dataDir = process.env.DATA_DIR || ".";
+const uploadsDir = path.resolve(dataDir, "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
 const upload = multer({
@@ -244,9 +245,14 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   app.patch("/api/lines/:id", (req, res) => {
-    const line = storage.updateLine(Number(req.params.id), req.body);
-    if (!line) return res.status(404).json({ error: "Line not found" });
-    res.json(line);
+    try {
+      const line = storage.updateLine(Number(req.params.id), req.body);
+      if (!line) return res.status(404).json({ error: "Line not found" });
+      res.json(line);
+    } catch (err: any) {
+      console.error("Line update error:", err.message, "Body:", JSON.stringify(req.body));
+      res.status(500).json({ error: "Failed to update line", detail: err.message });
+    }
   });
 
   app.delete("/api/lines/:id", (req, res) => {

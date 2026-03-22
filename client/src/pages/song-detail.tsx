@@ -95,14 +95,20 @@ function LineTimestampEditor({
     if (startMark === null || endMark === null) return;
     setIsSaving(true);
     try {
-      // Save timestamps to line
+      // Step 1: Save timestamps to line
       await apiRequest("PATCH", `/api/lines/${line.id}`, {
         startTime: startMark,
         endTime: endMark,
       });
+    } catch (err) {
+      console.error("Timestamp save error:", err);
+      toast({ title: "Save failed", description: "Could not save the start/end times. Try again.", variant: "destructive" });
+      setIsSaving(false);
+      return;
+    }
 
-      // Now analyze the pitch of this segment
-      const songAudioFilename = songAudioUrl.split("/").pop();
+    // Step 2: Analyze pitch (optional — timestamps are already saved)
+    try {
       const analyzeRes = await apiRequest("POST", "/api/analyze-audio-pitch", {
         audioUrl: songAudioUrl,
         startTime: startMark,
@@ -116,10 +122,12 @@ function LineTimestampEditor({
       });
 
       toast({ title: "Timestamps saved", description: "The target notes for this line have been analyzed." });
-      onSaved();
-    } catch {
-      toast({ title: "Save failed", variant: "destructive" });
+    } catch (err) {
+      console.error("Pitch analysis error:", err);
+      // Timestamps were saved even if pitch analysis failed
+      toast({ title: "Timestamps saved", description: "Couldn't analyze the target pitch right now, but your start/end points are saved." });
     }
+    onSaved();
     setIsSaving(false);
   };
 

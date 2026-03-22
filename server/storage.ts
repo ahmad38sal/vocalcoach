@@ -1,6 +1,7 @@
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
 import { eq, desc, and } from "drizzle-orm";
+import fs from "fs";
 import {
   songs, lines, recordings, metrics, drills, checkpoints, chatMessages, dailyPlans,
   type Song, type InsertSong,
@@ -13,7 +14,10 @@ import {
   type DailyPlan, type InsertDailyPlan,
 } from "@shared/schema";
 
-const sqlite = new Database("vocalcoach.db");
+const dataDir = process.env.DATA_DIR || ".";
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+const dbPath = `${dataDir}/vocalcoach.db`;
+const sqlite = new Database(dbPath);
 sqlite.pragma("journal_mode = WAL");
 const db = drizzle(sqlite);
 
