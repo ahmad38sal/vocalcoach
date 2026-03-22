@@ -95,9 +95,25 @@ export default function LinePractice() {
     }
   }, [existingMetrics, analysis, line]);
 
-  // Load reference recording pitch data on mount
+  // Use song audio pitch data as reference when available (from timestamps),
+  // otherwise fall back to user's reference recording
+  const hasSongReference = !!(line?.targetPitchData);
+
   useEffect(() => {
-    if (referenceData.length === 0 && lineId) {
+    if (referenceData.length > 0) return;
+
+    // Priority 1: Use target pitch data extracted from the uploaded song audio
+    if (line?.targetPitchData) {
+      try {
+        const parsed = JSON.parse(line.targetPitchData);
+        const mapped = parsed.map((p: any) => ({ time: p.time, midi: p.midi, note: p.note }));
+        setReferenceData(mapped);
+        return;
+      } catch { /* parse failed, fall through */ }
+    }
+
+    // Priority 2: Fall back to user's recorded reference
+    if (lineId) {
       apiRequest("GET", `/api/lines/${lineId}/reference`)
         .then(res => {
           if (res.ok) return res.json();
@@ -105,7 +121,6 @@ export default function LinePractice() {
         })
         .then(async (refRec) => {
           if (!refRec?.audioData) return;
-          // Decode reference audio and extract pitch
           try {
             const audioCtx = new AudioContext();
             const binary = atob(refRec.audioData);
@@ -120,7 +135,7 @@ export default function LinePractice() {
         })
         .catch(() => { /* no reference */ });
     }
-  }, [lineId, referenceData.length]);
+  }, [lineId, referenceData.length, line?.targetPitchData]);
 
   const saveRecording = useMutation({
     mutationFn: async (data: { audioData: string; duration: number; isReference: boolean; isBaseline: boolean }) => {
@@ -320,23 +335,27 @@ export default function LinePractice() {
 
         {/* Record Tab */}
         <TabsContent value="record" className="space-y-6 mt-6">
-          {/* Reference toggle */}
+          {/* Reference info */}
           <Card className="bg-muted/30">
             <CardContent className="p-4">
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <div>
                   <p className="text-sm font-medium">Reference melody</p>
                   <p className="text-xs text-muted-foreground">
-                    {referenceData.length > 0
-                      ? "Reference is set. Your takes will be compared to it."
-                      : "Record a reference take first — sing the line the way you want it to sound."}
+                    {hasSongReference
+                      ? "Using the original song audio as your reference. Your takes will be compared to it."
+                      : referenceData.length > 0
+                        ? "Reference is set. Your takes will be compared to it."
+                        : "Record a reference take — sing the line the way you want it to sound."}
                   </p>
                 </div>
-                {referenceData.length > 0 && (
-                  <Badge variant="secondary" className="text-xs">Set</Badge>
+                {(hasSongReference || referenceData.length > 0) && (
+                  <Badge variant="secondary" className="text-xs">
+                    {hasSongReference ? "Song audio" : "Your recording"}
+                  </Badge>
                 )}
               </div>
-              {referenceData.length === 0 && (
+              {!hasSongReference && referenceData.length === 0 && (
                 <div className="mt-3">
                   <Recorder onRecordingComplete={setAsReference} />
                 </div>
