@@ -61,8 +61,36 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     if (!url) return res.status(400).json({ error: "URL required" });
 
     try {
-      // Get video title first
-      const titleStr = execSync(`yt-dlp --get-title "${url}"`, { encoding: "utf-8", timeout: 30000 }).trim();
+      // Get video metadata (title + artist/track when available)
+      let titleStr = "";
+      let parsedArtist = "";
+      let parsedTrack = "";
+      try {
+        const metaJson = execSync(
+          `yt-dlp --dump-json --no-download "${url}"`,
+          { encoding: "utf-8", timeout: 30000 }
+        );
+        const meta = JSON.parse(metaJson);
+        titleStr = meta.track || meta.title || "";
+        parsedArtist = meta.artist || meta.creator || meta.uploader || meta.channel || "";
+        parsedTrack = meta.track || "";
+
+        // If no track metadata, try to parse "Artist - Title" from video title
+        if (!parsedTrack && meta.title) {
+          const dashMatch = meta.title.match(/^(.+?)\s*[-–—]\s*(.+)$/);
+          if (dashMatch) {
+            parsedArtist = parsedArtist || dashMatch[1].trim();
+            parsedTrack = dashMatch[2].trim()
+              .replace(/\s*\(.*?(official|video|audio|lyrics|hd|hq|4k|visualizer|remaster).*?\)/gi, "")
+              .replace(/\s*\[.*?(official|video|audio|lyrics|hd|hq|4k|visualizer|remaster).*?\]/gi, "")
+              .trim();
+            titleStr = parsedTrack || titleStr;
+          }
+        }
+      } catch {
+        // Fallback: just get the title
+        titleStr = execSync(`yt-dlp --get-title "${url}"`, { encoding: "utf-8", timeout: 30000 }).trim();
+      }
 
       // Download audio as mp3
       const outFile = path.join(uploadsDir, `yt_${Date.now()}.mp3`);
@@ -77,16 +105,72 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         // Search for the file
         const files = fs.readdirSync(uploadsDir).filter(f => f.startsWith(`yt_${outFile.split('yt_')[1]?.split('.')[0] || ''}`));
         if (files.length > 0) {
-          res.json({ filePath: path.join(uploadsDir, files[0]), title: titleStr });
+          res.json({ filePath: path.join(uploadsDir, files[0]), title: titleStr, artist: parsedArtist, track: parsedTrack });
           return;
         }
         return res.status(500).json({ error: "Download failed" });
       }
 
-      res.json({ filePath: actualFile, title: titleStr });
+      res.json({ filePath: actualFile, title: titleStr, artist: parsedArtist, track: parsedTrack });
     } catch (err: any) {
       console.error("YouTube extract error:", err.message);
       res.status(500).json({ error: "Could not extract audio. Check the URL and try again." });
+    }
+  });
+
+  // --- Lyrics Fetch (lrclib.net) ---
+  app.get("/api/lyrics", async (req, res) => {
+    const { q, artist, track } = req.query;
+    if (!q && !track) return res.status(400).json({ error: "Provide q (search query) or track name" });
+
+    try {
+      let lyrics: string | null = null;
+      let foundArtist = "";
+      let foundTrack = "";
+
+      // Try exact match first if we have artist + track
+      if (artist && track) {
+        const exactUrl = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(String(artist))}&track_name=${encodeURIComponent(String(track))}`;
+        const exactRes = await fetch(exactUrl, {
+          headers: { "User-Agent": "VocalCoach/1.0" },
+        });
+        if (exactRes.ok) {
+          const data = await exactRes.json();
+          if (data.plainLyrics) {
+            lyrics = data.plainLyrics;
+            foundArtist = data.artistName || "";
+            foundTrack = data.trackName || "";
+          }
+        }
+      }
+
+      // Fallback to search
+      if (!lyrics) {
+        const searchQuery = String(q || `${artist || ""} ${track || ""}`).trim();
+        const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(searchQuery)}`;
+        const searchRes = await fetch(searchUrl, {
+          headers: { "User-Agent": "VocalCoach/1.0" },
+        });
+        if (searchRes.ok) {
+          const results = await searchRes.json();
+          if (Array.isArray(results) && results.length > 0) {
+            // Pick the first result with plainLyrics
+            const match = results.find((r: any) => r.plainLyrics) || results[0];
+            lyrics = match.plainLyrics || null;
+            foundArtist = match.artistName || "";
+            foundTrack = match.trackName || "";
+          }
+        }
+      }
+
+      if (!lyrics) {
+        return res.json({ lyrics: null, artist: foundArtist, track: foundTrack });
+      }
+
+      res.json({ lyrics, artist: foundArtist, track: foundTrack });
+    } catch (err: any) {
+      console.error("Lyrics fetch error:", err.message);
+      res.json({ lyrics: null, artist: "", track: "" });
     }
   });
 

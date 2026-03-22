@@ -4,9 +4,6 @@
 export function detectPitch(buffer: Float32Array, sampleRate: number): number | null {
   const SIZE = buffer.length;
   const MAX_SAMPLES = Math.floor(SIZE / 2);
-  let bestOffset = -1;
-  let bestCorrelation = 0;
-  let foundGoodCorrelation = false;
 
   // Check if there's enough signal
   let rms = 0;
@@ -14,11 +11,18 @@ export function detectPitch(buffer: Float32Array, sampleRate: number): number | 
     rms += buffer[i] * buffer[i];
   }
   rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.01) return null; // Too quiet
+  if (rms < 0.005) return null; // Too quiet
 
-  const correlations = new Float32Array(MAX_SAMPLES);
+  // Search for fundamental period in the voice range (~60Hz to ~1000Hz)
+  const minPeriod = Math.floor(sampleRate / 1000);
+  const maxPeriod = Math.min(Math.floor(sampleRate / 60), MAX_SAMPLES);
+  const correlations = new Float32Array(maxPeriod + 1);
 
-  for (let offset = 0; offset < MAX_SAMPLES; offset++) {
+  let bestOffset = -1;
+  let bestCorrelation = 0;
+  let foundGoodCorrelation = false;
+
+  for (let offset = minPeriod; offset <= maxPeriod; offset++) {
     let correlation = 0;
     for (let i = 0; i < MAX_SAMPLES; i++) {
       correlation += Math.abs(buffer[i] - buffer[i + offset]);
@@ -26,22 +30,22 @@ export function detectPitch(buffer: Float32Array, sampleRate: number): number | 
     correlation = 1 - correlation / MAX_SAMPLES;
     correlations[offset] = correlation;
 
-    if (correlation > 0.9 && correlation > bestCorrelation) {
+    if (correlation > 0.7 && correlation > bestCorrelation) {
       bestCorrelation = correlation;
       bestOffset = offset;
       foundGoodCorrelation = true;
-    } else if (foundGoodCorrelation) {
-      // Already found a good correlation, stop looking
+    } else if (foundGoodCorrelation && correlation < bestCorrelation - 0.1) {
       break;
     }
   }
 
-  if (bestCorrelation > 0.01 && bestOffset > 0) {
-    // Parabolic interpolation for better accuracy
-    const shift =
-      (correlations[bestOffset + 1] - correlations[bestOffset - 1]) /
-      (2 * (2 * correlations[bestOffset] - correlations[bestOffset - 1] - correlations[bestOffset + 1]));
-    return sampleRate / (bestOffset + (shift || 0));
+  if (bestCorrelation > 0.5 && bestOffset > 0) {
+    // Parabolic interpolation for sub-sample accuracy
+    const prev = bestOffset > minPeriod ? correlations[bestOffset - 1] : correlations[bestOffset];
+    const next = bestOffset < maxPeriod ? correlations[bestOffset + 1] : correlations[bestOffset];
+    const denom = 2 * (2 * correlations[bestOffset] - prev - next);
+    const shift = denom !== 0 ? (next - prev) / denom : 0;
+    return sampleRate / (bestOffset + shift);
   }
   return null;
 }

@@ -1,7 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Mic, Square } from "lucide-react";
-import { detectPitch, freqToMidi, midiToNoteName, centsDeviation } from "@/lib/audio-analysis";
 
 interface PitchPoint {
   time: number;
@@ -20,6 +19,76 @@ const NOTE_COLORS: Record<string, string> = {
   "G#": "#3b82f6", "A": "#6366f1", "A#": "#8b5cf6", "B": "#a855f7",
 };
 
+// Lightweight pitch detection for real-time use (autocorrelation)
+function detectPitchRT(buffer: Float32Array, sampleRate: number): number | null {
+  const SIZE = buffer.length;
+  const MAX_SAMPLES = Math.floor(SIZE / 2);
+
+  // Check if there's enough signal — use a low threshold for live monitoring
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) {
+    rms += buffer[i] * buffer[i];
+  }
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.005) return null; // Very quiet — skip
+
+  // AMDF (Average Magnitude Difference Function) - more robust than raw autocorrelation
+  // Search for the fundamental period in the range ~60Hz to ~1000Hz
+  const minPeriod = Math.floor(sampleRate / 1000); // ~1000 Hz
+  const maxPeriod = Math.floor(sampleRate / 60);   // ~60 Hz
+  const searchEnd = Math.min(maxPeriod, MAX_SAMPLES);
+
+  let bestOffset = -1;
+  let bestCorrelation = 0;
+  let foundGoodCorrelation = false;
+  const correlations = new Float32Array(searchEnd + 1);
+
+  for (let offset = minPeriod; offset <= searchEnd; offset++) {
+    let correlation = 0;
+    for (let i = 0; i < MAX_SAMPLES; i++) {
+      correlation += Math.abs(buffer[i] - buffer[i + offset]);
+    }
+    correlation = 1 - correlation / MAX_SAMPLES;
+    correlations[offset] = correlation;
+
+    if (correlation > 0.7 && correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestOffset = offset;
+      foundGoodCorrelation = true;
+    } else if (foundGoodCorrelation && correlation < bestCorrelation - 0.1) {
+      // Past the peak — stop
+      break;
+    }
+  }
+
+  if (bestCorrelation > 0.5 && bestOffset > 0) {
+    // Parabolic interpolation for sub-sample accuracy
+    const prev = bestOffset > 0 ? correlations[bestOffset - 1] : correlations[bestOffset];
+    const next = bestOffset < searchEnd ? correlations[bestOffset + 1] : correlations[bestOffset];
+    const denom = 2 * (2 * correlations[bestOffset] - prev - next);
+    const shift = denom !== 0 ? (next - prev) / denom : 0;
+    return sampleRate / (bestOffset + shift);
+  }
+  return null;
+}
+
+function freqToMidiRT(freq: number): number {
+  return 69 + 12 * Math.log2(freq / 440);
+}
+
+function midiToNoteNameRT(midi: number): string {
+  const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const noteNum = Math.round(midi) % 12;
+  const octave = Math.floor(Math.round(midi) / 12) - 1;
+  return noteNames[noteNum >= 0 ? noteNum : noteNum + 12] + octave;
+}
+
+function centsDeviationRT(freq: number): number {
+  const midi = freqToMidiRT(freq);
+  const nearestMidi = Math.round(midi);
+  return (midi - nearestMidi) * 100;
+}
+
 export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
   const [isListening, setIsListening] = useState(false);
   const [currentNote, setCurrentNote] = useState<string | null>(null);
@@ -34,18 +103,69 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
   const bufferRef = useRef<Float32Array | null>(null);
   const startTimeRef = useRef(0);
   const historyRef = useRef<PitchPoint[]>([]);
+  const isListeningRef = useRef(false);
+
+  const detectLoop = useCallback(() => {
+    if (!isListeningRef.current) return;
+    if (!analyserRef.current || !bufferRef.current || !audioCtxRef.current) {
+      // Retry next frame if refs aren't ready yet
+      animRef.current = requestAnimationFrame(detectLoop);
+      return;
+    }
+
+    analyserRef.current.getFloatTimeDomainData(bufferRef.current);
+    const sampleRate = audioCtxRef.current.sampleRate;
+    const freq = detectPitchRT(bufferRef.current, sampleRate);
+
+    const time = (Date.now() - startTimeRef.current) / 1000;
+    let point: PitchPoint;
+
+    if (freq && freq > 60 && freq < 1500) {
+      const midi = freqToMidiRT(freq);
+      const note = midiToNoteNameRT(midi);
+      const cents = centsDeviationRT(freq);
+      point = { time, midi, note, cents };
+      setCurrentNote(note);
+      setCurrentCents(cents);
+      setCurrentMidi(midi);
+    } else {
+      point = { time, midi: null, note: null, cents: 0 };
+      // Don't immediately clear current note — keep it for a moment
+      // so display doesn't flash on/off
+    }
+
+    historyRef.current.push(point);
+    // Keep last 12 seconds of history
+    const cutoff = time - 12;
+    historyRef.current = historyRef.current.filter(p => p.time > cutoff);
+    setPitchHistory([...historyRef.current]);
+
+    animRef.current = requestAnimationFrame(detectLoop);
+  }, []);
 
   const startListening = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
       streamRef.current = stream;
 
       const audioCtx = new AudioContext();
       audioCtxRef.current = audioCtx;
 
+      // Resume context if suspended (Chrome autoplay policy)
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0;
       source.connect(analyser);
       analyserRef.current = analyser;
       bufferRef.current = new Float32Array(analyser.fftSize);
@@ -53,14 +173,17 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
       historyRef.current = [];
       setPitchHistory([]);
 
+      isListeningRef.current = true;
       setIsListening(true);
-      detectLoop();
-    } catch {
-      // mic denied
+      // Start the detection loop
+      animRef.current = requestAnimationFrame(detectLoop);
+    } catch (err) {
+      console.error("Microphone access failed:", err);
     }
-  }, []);
+  }, [detectLoop]);
 
   const stopListening = useCallback(() => {
+    isListeningRef.current = false;
     setIsListening(false);
     cancelAnimationFrame(animRef.current);
     if (streamRef.current) {
@@ -71,40 +194,8 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
       audioCtxRef.current.close();
       audioCtxRef.current = null;
     }
-  }, []);
-
-  const detectLoop = useCallback(() => {
-    if (!analyserRef.current || !bufferRef.current) return;
-
-    analyserRef.current.getFloatTimeDomainData(bufferRef.current);
-    const sampleRate = audioCtxRef.current?.sampleRate || 44100;
-    const freq = detectPitch(bufferRef.current, sampleRate);
-
-    const time = (Date.now() - startTimeRef.current) / 1000;
-    let point: PitchPoint;
-
-    if (freq && freq > 60 && freq < 2000) {
-      const midi = freqToMidi(freq);
-      const note = midiToNoteName(midi);
-      const cents = centsDeviation(freq);
-      point = { time, midi, note, cents };
-      setCurrentNote(note);
-      setCurrentCents(cents);
-      setCurrentMidi(midi);
-    } else {
-      point = { time, midi: null, note: null, cents: 0 };
-      setCurrentNote(null);
-      setCurrentCents(0);
-      setCurrentMidi(null);
-    }
-
-    historyRef.current.push(point);
-    // Keep last 10 seconds
-    const cutoff = time - 10;
-    historyRef.current = historyRef.current.filter(p => p.time > cutoff);
-    setPitchHistory([...historyRef.current]);
-
-    animRef.current = requestAnimationFrame(detectLoop);
+    analyserRef.current = null;
+    bufferRef.current = null;
   }, []);
 
   // Draw the scrolling pitch canvas
@@ -131,13 +222,19 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
       ctx.fillStyle = isDark ? "#797876" : "#7a7974";
       ctx.font = "13px 'General Sans', sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("Start singing to see your pitch here", w / 2, h / 2);
+      ctx.fillText(isListening ? "Listening... sing something" : "Start singing to see your pitch here", w / 2, h / 2);
       return;
     }
 
     // Determine MIDI range from data
     const validMidis = pitchHistory.filter(p => p.midi !== null).map(p => p.midi!);
-    if (validMidis.length === 0) return;
+    if (validMidis.length === 0) {
+      ctx.fillStyle = isDark ? "#797876" : "#7a7974";
+      ctx.font = "13px 'General Sans', sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Listening... sing or hum something", w / 2, h / 2);
+      return;
+    }
 
     const minMidi = Math.floor(Math.min(...validMidis)) - 3;
     const maxMidi = Math.ceil(Math.max(...validMidis)) + 3;
@@ -187,17 +284,14 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
       }
     }
 
-    // Draw pitch points
+    // Draw pitch points as connected line with dots
     const points = pitchHistory.filter(p => p.midi !== null && p.time >= timeStart);
-    for (let i = 1; i < points.length; i++) {
+    for (let i = 0; i < points.length; i++) {
       const p = points[i];
-      const prev = points[i - 1];
-      if (!p.midi || !prev.midi) continue;
+      if (!p.midi) continue;
 
-      const x1 = xScale(prev.time);
-      const y1 = yScale(prev.midi);
-      const x2 = xScale(p.time);
-      const y2 = yScale(p.midi);
+      const x = xScale(p.time);
+      const y = yScale(p.midi);
 
       // Color based on cents deviation
       const absCents = Math.abs(p.cents);
@@ -207,17 +301,28 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
           ? (isDark ? "#e8af34" : "#d19900")  // yellow - close
           : (isDark ? "#dd6974" : "#a13544"); // red - off
 
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
+      // Draw line to previous point
+      if (i > 0) {
+        const prev = points[i - 1];
+        if (prev.midi) {
+          const x1 = xScale(prev.time);
+          const y1 = yScale(prev.midi);
+          // Only draw line if points are close in time (< 0.3s gap)
+          if (p.time - prev.time < 0.3) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x, y);
+            ctx.stroke();
+          }
+        }
+      }
 
-      // Draw dot at current point
+      // Draw dot
       ctx.fillStyle = color;
       ctx.beginPath();
-      ctx.arc(x2, y2, 3, 0, Math.PI * 2);
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
       ctx.fill();
     }
 
@@ -229,11 +334,12 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
       ctx.textAlign = "left";
       ctx.fillText(currentNote || "", w - 40, y + 5);
     }
-  }, [pitchHistory, currentMidi, currentNote, referenceNotes]);
+  }, [pitchHistory, currentMidi, currentNote, referenceNotes, isListening]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      isListeningRef.current = false;
       cancelAnimationFrame(animRef.current);
       streamRef.current?.getTracks().forEach(t => t.stop());
       audioCtxRef.current?.close();
@@ -288,7 +394,7 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
 
           {isListening && !currentNote && (
             <div className="text-sm text-muted-foreground animate-pulse">
-              Listening...
+              Listening... sing or hum something
             </div>
           )}
         </div>
@@ -319,7 +425,7 @@ export function LivePitchMonitor({ referenceNotes }: LivePitchMonitorProps) {
       <canvas
         ref={canvasRef}
         className="w-full rounded-lg border"
-        style={{ height: 200 }}
+        style={{ height: 220 }}
         data-testid="canvas-pitch"
       />
 
